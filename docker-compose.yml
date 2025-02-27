@@ -1,5 +1,6 @@
 services:
   lightrag:
+    
     build: .
     ports:
       - "${PORT:-9621}:9621"

@@ -45,7 +45,6 @@ from .utils import (
     lazy_external_import,
     limit_async_func_call,
     logger,
-    set_logger,
 )
 from .types import KnowledgeGraph
 from dotenv import load_dotenv
@@ -268,8 +267,13 @@ class LightRAG:
 
     def __post_init__(self):
         os.makedirs(os.path.dirname(self.log_file_path), exist_ok=True)
-        set_logger(self.log_file_path, self.log_level)
         logger.info(f"Logger initialized for working directory: {self.working_dir}")
+
+        from lightrag.kg.shared_storage import (
+            initialize_share_data,
+        )
+
+        initialize_share_data()
 
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory {self.working_dir}")
@@ -359,14 +363,14 @@ class LightRAG:
                 self.namespace_prefix, NameSpace.VECTOR_STORE_ENTITIES
             ),
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name"},
+            meta_fields={"entity_name", "source_id", "content"},
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.VECTOR_STORE_RELATIONSHIPS
             ),
             embedding_func=self.embedding_func,
-            meta_fields={"src_id", "tgt_id"},
+            meta_fields={"src_id", "tgt_id", "source_id", "content"},
         )
         self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=make_namespace(
@@ -692,117 +696,221 @@ class LightRAG:
         3. Process each chunk for entity and relation extraction
         4. Update the document status
         """
-        # 1. Get all pending, failed, and abnormally terminated processing documents.
-        # Run the asynchronous status retrievals in parallel using asyncio.gather
-        processing_docs, failed_docs, pending_docs = await asyncio.gather(
-            self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
-            self.doc_status.get_docs_by_status(DocStatus.FAILED),
-            self.doc_status.get_docs_by_status(DocStatus.PENDING),
+        from lightrag.kg.shared_storage import (
+            get_namespace_data,
+            get_pipeline_status_lock,
         )
 
-        to_process_docs: dict[str, DocProcessingStatus] = {}
-        to_process_docs.update(processing_docs)
-        to_process_docs.update(failed_docs)
-        to_process_docs.update(pending_docs)
+        # Get pipeline status shared data and lock
+        pipeline_status = await get_namespace_data("pipeline_status")
+        pipeline_status_lock = get_pipeline_status_lock()
 
-        if not to_process_docs:
-            logger.info("All documents have been processed or are duplicates")
-            return
+        # Check if another process is already processing the queue
+        async with pipeline_status_lock:
+            # Ensure only one worker is processing documents
+            if not pipeline_status.get("busy", False):
+                # 先检查是否有需要处理的文档
+                processing_docs, failed_docs, pending_docs = await asyncio.gather(
+                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+                    self.doc_status.get_docs_by_status(DocStatus.FAILED),
+                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                )
 
-        # 2. split docs into chunks, insert chunks, update doc status
-        docs_batches = [
-            list(to_process_docs.items())[i : i + self.max_parallel_insert]
-            for i in range(0, len(to_process_docs), self.max_parallel_insert)
-        ]
+                to_process_docs: dict[str, DocProcessingStatus] = {}
+                to_process_docs.update(processing_docs)
+                to_process_docs.update(failed_docs)
+                to_process_docs.update(pending_docs)
 
-        logger.info(f"Number of batches to process: {len(docs_batches)}.")
+                # 如果没有需要处理的文档，直接返回，保留 pipeline_status 中的内容不变
+                if not to_process_docs:
+                    logger.info("No documents to process")
+                    return
 
-        batches: list[Any] = []
-        # 3. iterate over batches
-        for batch_idx, docs_batch in enumerate(docs_batches):
-
-            async def batch(
-                batch_idx: int,
-                docs_batch: list[tuple[str, DocProcessingStatus]],
-                size_batch: int,
-            ) -> None:
-                logger.info(f"Start processing batch {batch_idx + 1} of {size_batch}.")
-                # 4. iterate over batch
-                for doc_id_processing_status in docs_batch:
-                    doc_id, status_doc = doc_id_processing_status
-                    # Generate chunks from document
-                    chunks: dict[str, Any] = {
-                        compute_mdhash_id(dp["content"], prefix="chunk-"): {
-                            **dp,
-                            "full_doc_id": doc_id,
-                        }
-                        for dp in self.chunking_func(
-                            status_doc.content,
-                            split_by_character,
-                            split_by_character_only,
-                            self.chunk_overlap_token_size,
-                            self.chunk_token_size,
-                            self.tiktoken_model_name,
-                        )
+                # 有文档需要处理，更新 pipeline_status
+                pipeline_status.update(
+                    {
+                        "busy": True,
+                        "job_name": "indexing files",
+                        "job_start": datetime.now().isoformat(),
+                        "docs": 0,
+                        "batchs": 0,
+                        "cur_batch": 0,
+                        "request_pending": False,  # Clear any previous request
+                        "latest_message": "",
                     }
-                    # Process document (text chunks and full docs) in parallel
-                    tasks = [
-                        self.doc_status.upsert(
-                            {
-                                doc_id: {
-                                    "status": DocStatus.PROCESSING,
-                                    "updated_at": datetime.now().isoformat(),
-                                    "content": status_doc.content,
-                                    "content_summary": status_doc.content_summary,
-                                    "content_length": status_doc.content_length,
-                                    "created_at": status_doc.created_at,
-                                }
-                            }
-                        ),
-                        self.chunks_vdb.upsert(chunks),
-                        self._process_entity_relation_graph(chunks),
-                        self.full_docs.upsert(
-                            {doc_id: {"content": status_doc.content}}
-                        ),
-                        self.text_chunks.upsert(chunks),
-                    ]
-                    try:
-                        await asyncio.gather(*tasks)
-                        await self.doc_status.upsert(
-                            {
-                                doc_id: {
-                                    "status": DocStatus.PROCESSED,
-                                    "chunks_count": len(chunks),
-                                    "content": status_doc.content,
-                                    "content_summary": status_doc.content_summary,
-                                    "content_length": status_doc.content_length,
-                                    "created_at": status_doc.created_at,
-                                    "updated_at": datetime.now().isoformat(),
-                                }
-                            }
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to process document {doc_id}: {str(e)}")
-                        await self.doc_status.upsert(
-                            {
-                                doc_id: {
-                                    "status": DocStatus.FAILED,
-                                    "error": str(e),
-                                    "content": status_doc.content,
-                                    "content_summary": status_doc.content_summary,
-                                    "content_length": status_doc.content_length,
-                                    "created_at": status_doc.created_at,
-                                    "updated_at": datetime.now().isoformat(),
-                                }
-                            }
-                        )
-                        continue
-                logger.info(f"Completed batch {batch_idx + 1} of {len(docs_batches)}.")
+                )
+                # Cleaning history_messages without breaking it as a shared list object
+                del pipeline_status["history_messages"][:]
+            else:
+                # Another process is busy, just set request flag and return
+                pipeline_status["request_pending"] = True
+                logger.info(
+                    "Another process is already processing the document queue. Request queued."
+                )
+                return
 
-            batches.append(batch(batch_idx, docs_batch, len(docs_batches)))
+        try:
+            # Process documents until no more documents or requests
+            while True:
+                if not to_process_docs:
+                    log_message = "All documents have been processed or are duplicates"
+                    logger.info(log_message)
+                    pipeline_status["latest_message"] = log_message
+                    pipeline_status["history_messages"].append(log_message)
+                    break
 
-        await asyncio.gather(*batches)
-        await self._insert_done()
+                # 2. split docs into chunks, insert chunks, update doc status
+                docs_batches = [
+                    list(to_process_docs.items())[i : i + self.max_parallel_insert]
+                    for i in range(0, len(to_process_docs), self.max_parallel_insert)
+                ]
+
+                log_message = f"Number of batches to process: {len(docs_batches)}."
+                logger.info(log_message)
+
+                # Update pipeline status with current batch information
+                pipeline_status["docs"] += len(to_process_docs)
+                pipeline_status["batchs"] += len(docs_batches)
+                pipeline_status["latest_message"] = log_message
+                pipeline_status["history_messages"].append(log_message)
+
+                batches: list[Any] = []
+                # 3. iterate over batches
+                for batch_idx, docs_batch in enumerate(docs_batches):
+                    # Update current batch in pipeline status (directly, as it's atomic)
+                    pipeline_status["cur_batch"] += 1
+
+                    async def batch(
+                        batch_idx: int,
+                        docs_batch: list[tuple[str, DocProcessingStatus]],
+                        size_batch: int,
+                    ) -> None:
+                        log_message = (
+                            f"Start processing batch {batch_idx + 1} of {size_batch}."
+                        )
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+                        # 4. iterate over batch
+                        for doc_id_processing_status in docs_batch:
+                            doc_id, status_doc = doc_id_processing_status
+                            # Generate chunks from document
+                            chunks: dict[str, Any] = {
+                                compute_mdhash_id(dp["content"], prefix="chunk-"): {
+                                    **dp,
+                                    "full_doc_id": doc_id,
+                                }
+                                for dp in self.chunking_func(
+                                    status_doc.content,
+                                    split_by_character,
+                                    split_by_character_only,
+                                    self.chunk_overlap_token_size,
+                                    self.chunk_token_size,
+                                    self.tiktoken_model_name,
+                                )
+                            }
+                            # Process document (text chunks and full docs) in parallel
+                            tasks = [
+                                self.doc_status.upsert(
+                                    {
+                                        doc_id: {
+                                            "status": DocStatus.PROCESSING,
+                                            "updated_at": datetime.now().isoformat(),
+                                            "content": status_doc.content,
+                                            "content_summary": status_doc.content_summary,
+                                            "content_length": status_doc.content_length,
+                                            "created_at": status_doc.created_at,
+                                        }
+                                    }
+                                ),
+                                self.chunks_vdb.upsert(chunks),
+                                self._process_entity_relation_graph(chunks),
+                                self.full_docs.upsert(
+                                    {doc_id: {"content": status_doc.content}}
+                                ),
+                                self.text_chunks.upsert(chunks),
+                            ]
+                            try:
+                                await asyncio.gather(*tasks)
+                                await self.doc_status.upsert(
+                                    {
+                                        doc_id: {
+                                            "status": DocStatus.PROCESSED,
+                                            "chunks_count": len(chunks),
+                                            "content": status_doc.content,
+                                            "content_summary": status_doc.content_summary,
+                                            "content_length": status_doc.content_length,
+                                            "created_at": status_doc.created_at,
+                                            "updated_at": datetime.now().isoformat(),
+                                        }
+                                    }
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to process document {doc_id}: {str(e)}"
+                                )
+                                await self.doc_status.upsert(
+                                    {
+                                        doc_id: {
+                                            "status": DocStatus.FAILED,
+                                            "error": str(e),
+                                            "content": status_doc.content,
+                                            "content_summary": status_doc.content_summary,
+                                            "content_length": status_doc.content_length,
+                                            "created_at": status_doc.created_at,
+                                            "updated_at": datetime.now().isoformat(),
+                                        }
+                                    }
+                                )
+                                continue
+                        log_message = (
+                            f"Completed batch {batch_idx + 1} of {len(docs_batches)}."
+                        )
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+
+                    batches.append(batch(batch_idx, docs_batch, len(docs_batches)))
+
+                await asyncio.gather(*batches)
+                await self._insert_done()
+
+                # Check if there's a pending request to process more documents (with lock)
+                has_pending_request = False
+                async with pipeline_status_lock:
+                    has_pending_request = pipeline_status.get("request_pending", False)
+                    if has_pending_request:
+                        # Clear the request flag before checking for more documents
+                        pipeline_status["request_pending"] = False
+
+                if not has_pending_request:
+                    break
+
+                log_message = "Processing additional documents due to pending request"
+                logger.info(log_message)
+                pipeline_status["latest_message"] = log_message
+                pipeline_status["history_messages"].append(log_message)
+
+                # 获取新的待处理文档
+                processing_docs, failed_docs, pending_docs = await asyncio.gather(
+                    self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+                    self.doc_status.get_docs_by_status(DocStatus.FAILED),
+                    self.doc_status.get_docs_by_status(DocStatus.PENDING),
+                )
+
+                to_process_docs = {}
+                to_process_docs.update(processing_docs)
+                to_process_docs.update(failed_docs)
+                to_process_docs.update(pending_docs)
+
+        finally:
+            log_message = "Document processing pipeline completed"
+            logger.info(log_message)
+            # Always reset busy status when done or if an exception occurs (with lock)
+            async with pipeline_status_lock:
+                pipeline_status["busy"] = False
+                pipeline_status["latest_message"] = log_message
+                pipeline_status["history_messages"].append(log_message)
 
     async def _process_entity_relation_graph(self, chunk: dict[str, Any]) -> None:
         try:
@@ -833,7 +941,16 @@ class LightRAG:
             if storage_inst is not None
         ]
         await asyncio.gather(*tasks)
-        logger.info("All Insert done")
+
+        log_message = "All Insert done"
+        logger.info(log_message)
+
+        # 获取 pipeline_status 并更新 latest_message 和 history_messages
+        from lightrag.kg.shared_storage import get_namespace_data
+
+        pipeline_status = await get_namespace_data("pipeline_status")
+        pipeline_status["latest_message"] = log_message
+        pipeline_status["history_messages"].append(log_message)
 
     def insert_custom_kg(self, custom_kg: dict[str, Any]) -> None:
         loop = always_get_an_event_loop()
@@ -880,7 +997,7 @@ class LightRAG:
             # Insert entities into knowledge graph
             all_entities_data: list[dict[str, str]] = []
             for entity_data in custom_kg.get("entities", []):
-                entity_name = f'"{entity_data["entity_name"].upper()}"'
+                entity_name = entity_data["entity_name"]
                 entity_type = entity_data.get("entity_type", "UNKNOWN")
                 description = entity_data.get("description", "No description provided")
                 # source_id = entity_data["source_id"]
@@ -910,8 +1027,8 @@ class LightRAG:
             # Insert relationships into knowledge graph
             all_relationships_data: list[dict[str, str]] = []
             for relationship_data in custom_kg.get("relationships", []):
-                src_id = f'"{relationship_data["src_id"].upper()}"'
-                tgt_id = f'"{relationship_data["tgt_id"].upper()}"'
+                src_id = relationship_data["src_id"]
+                tgt_id = relationship_data["tgt_id"]
                 description = relationship_data["description"]
                 keywords = relationship_data["keywords"]
                 weight = relationship_data.get("weight", 1.0)
@@ -1213,8 +1330,6 @@ class LightRAG:
         return loop.run_until_complete(self.adelete_by_entity(entity_name))
 
     async def adelete_by_entity(self, entity_name: str) -> None:
-        entity_name = f'"{entity_name.upper()}"'
-
         try:
             await self.entities_vdb.delete_entity(entity_name)
             await self.relationships_vdb.delete_entity_relation(entity_name)
@@ -1287,12 +1402,14 @@ class LightRAG:
 
             logger.debug(f"Starting deletion for document {doc_id}")
 
+            doc_to_chunk_id = doc_id.replace("doc", "chunk")
+
             # 2. Get all related chunks
-            chunks = await self.text_chunks.get_by_id(doc_id)
+            chunks = await self.text_chunks.get_by_id(doc_to_chunk_id)
             if not chunks:
                 return
 
-            chunk_ids = list(chunks.keys())
+            chunk_ids = {chunks["full_doc_id"].replace("doc", "chunk")}
             logger.debug(f"Found {len(chunk_ids)} chunks to delete")
 
             # 3. Before deleting, check the related entities and relationships for these chunks
@@ -1301,7 +1418,7 @@ class LightRAG:
                 entities = [
                     dp
                     for dp in self.entities_vdb.client_storage["data"]
-                    if dp.get("source_id") == chunk_id
+                    if chunk_id in dp.get("source_id")
                 ]
                 logger.debug(f"Chunk {chunk_id} has {len(entities)} related entities")
 
@@ -1309,7 +1426,7 @@ class LightRAG:
                 relations = [
                     dp
                     for dp in self.relationships_vdb.client_storage["data"]
-                    if dp.get("source_id") == chunk_id
+                    if chunk_id in dp.get("source_id")
                 ]
                 logger.debug(f"Chunk {chunk_id} has {len(relations)} related relations")
 
@@ -1420,42 +1537,71 @@ class LightRAG:
                 f"Updated {len(entities_to_update)} entities and {len(relationships_to_update)} relationships."
             )
 
+            async def process_data(data_type, vdb, chunk_id):
+                # Check data (entities or relationships)
+                data_with_chunk = [
+                    dp
+                    for dp in vdb.client_storage["data"]
+                    if chunk_id in (dp.get("source_id") or "").split(GRAPH_FIELD_SEP)
+                ]
+
+                data_for_vdb = {}
+                if data_with_chunk:
+                    logger.warning(
+                        f"found {len(data_with_chunk)} {data_type} still referencing chunk {chunk_id}"
+                    )
+
+                    for item in data_with_chunk:
+                        old_sources = item["source_id"].split(GRAPH_FIELD_SEP)
+                        new_sources = [src for src in old_sources if src != chunk_id]
+
+                        if not new_sources:
+                            logger.info(
+                                f"{data_type} {item.get('entity_name', 'N/A')} is deleted because source_id is not exists"
+                            )
+                            await vdb.delete_entity(item)
+                        else:
+                            item["source_id"] = GRAPH_FIELD_SEP.join(new_sources)
+                            item_id = item["__id__"]
+                            data_for_vdb[item_id] = item.copy()
+                            if data_type == "entities":
+                                data_for_vdb[item_id]["content"] = data_for_vdb[
+                                    item_id
+                                ].get("content") or (
+                                    item.get("entity_name", "")
+                                    + (item.get("description") or "")
+                                )
+                            else:  # relationships
+                                data_for_vdb[item_id]["content"] = data_for_vdb[
+                                    item_id
+                                ].get("content") or (
+                                    (item.get("keywords") or "")
+                                    + (item.get("src_id") or "")
+                                    + (item.get("tgt_id") or "")
+                                    + (item.get("description") or "")
+                                )
+
+                    if data_for_vdb:
+                        await vdb.upsert(data_for_vdb)
+                        logger.info(f"Successfully updated {data_type} in vector DB")
+
             # Add verification step
             async def verify_deletion():
                 # Verify if the document has been deleted
                 if await self.full_docs.get_by_id(doc_id):
-                    logger.error(f"Document {doc_id} still exists in full_docs")
+                    logger.warning(f"Document {doc_id} still exists in full_docs")
 
                 # Verify if chunks have been deleted
-                remaining_chunks = await self.text_chunks.get_by_id(doc_id)
+                remaining_chunks = await self.text_chunks.get_by_id(doc_to_chunk_id)
                 if remaining_chunks:
-                    logger.error(f"Found {len(remaining_chunks)} remaining chunks")
+                    logger.warning(f"Found {len(remaining_chunks)} remaining chunks")
 
                 # Verify entities and relationships
                 for chunk_id in chunk_ids:
-                    # Check entities
-                    entities_with_chunk = [
-                        dp
-                        for dp in self.entities_vdb.client_storage["data"]
-                        if chunk_id
-                        in (dp.get("source_id") or "").split(GRAPH_FIELD_SEP)
-                    ]
-                    if entities_with_chunk:
-                        logger.error(
-                            f"Found {len(entities_with_chunk)} entities still referencing chunk {chunk_id}"
-                        )
-
-                    # Check relationships
-                    relations_with_chunk = [
-                        dp
-                        for dp in self.relationships_vdb.client_storage["data"]
-                        if chunk_id
-                        in (dp.get("source_id") or "").split(GRAPH_FIELD_SEP)
-                    ]
-                    if relations_with_chunk:
-                        logger.error(
-                            f"Found {len(relations_with_chunk)} relations still referencing chunk {chunk_id}"
-                        )
+                    await process_data("entities", self.entities_vdb, chunk_id)
+                    await process_data(
+                        "relationships", self.relationships_vdb, chunk_id
+                    )
 
             await verify_deletion()
 
@@ -1478,7 +1624,6 @@ class LightRAG:
                 - graph_data: Complete node data from the graph database
                 - vector_data: (optional) Data from the vector database
         """
-        entity_name = f'"{entity_name.upper()}"'
 
         # Get information from the graph
         node_data = await self.chunk_entity_relation_graph.get_node(entity_name)
@@ -1516,8 +1661,6 @@ class LightRAG:
                 - graph_data: Complete edge data from the graph database
                 - vector_data: (optional) Data from the vector database
         """
-        src_entity = f'"{src_entity.upper()}"'
-        tgt_entity = f'"{tgt_entity.upper()}"'
 
         # Get information from the graph
         edge_data = await self.chunk_entity_relation_graph.get_edge(
@@ -1557,3 +1700,50 @@ class LightRAG:
                 f"Storage implementation '{storage_name}' requires the following "
                 f"environment variables: {', '.join(missing_vars)}"
             )
+
+    async def aclear_cache(self, modes: list[str] | None = None) -> None:
+        """Clear cache data from the LLM response cache storage.
+
+        Args:
+            modes (list[str] | None): Modes of cache to clear. Options: ["default", "naive", "local", "global", "hybrid", "mix"].
+                             "default" represents extraction cache.
+                             If None, clears all cache.
+
+        Example:
+            # Clear all cache
+            await rag.aclear_cache()
+
+            # Clear local mode cache
+            await rag.aclear_cache(modes=["local"])
+
+            # Clear extraction cache
+            await rag.aclear_cache(modes=["default"])
+        """
+        if not self.llm_response_cache:
+            logger.warning("No cache storage configured")
+            return
+
+        valid_modes = ["default", "naive", "local", "global", "hybrid", "mix"]
+
+        # Validate input
+        if modes and not all(mode in valid_modes for mode in modes):
+            raise ValueError(f"Invalid mode. Valid modes are: {valid_modes}")
+
+        try:
+            # Reset the cache storage for specified mode
+            if modes:
+                await self.llm_response_cache.delete(modes)
+                logger.info(f"Cleared cache for modes: {modes}")
+            else:
+                # Clear all modes
+                await self.llm_response_cache.delete(valid_modes)
+                logger.info("Cleared all cache")
+
+            await self.llm_response_cache.index_done_callback()
+
+        except Exception as e:
+            logger.error(f"Error while clearing cache: {e}")
+
+    def clear_cache(self, modes: list[str] | None = None) -> None:
+        """Synchronous version of aclear_cache."""
+        return always_get_an_event_loop().run_until_complete(self.aclear_cache(modes))
